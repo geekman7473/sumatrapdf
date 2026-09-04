@@ -38,6 +38,8 @@ struct TextSearch : public TextSelection {
     Str anchor;
     int findTextLen = 0;
     int anchorLen = 0;
+    // case-folded codepoints of anchor
+    Vec<int> anchorFolded;
     int findPage = 0;
     int searchHitStartAt = 0; // when text found spans several pages, searchHitStartAt < findPage
     bool forward = true;

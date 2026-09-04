@@ -47,6 +47,8 @@ static void SkipWhitespace(Str text, int textLen, int& idx, int& byteIdx) {
 // cf. https://code.google.com/archive/p/sumatrapdf/issues/959
 #define isnoncjkwordchar(c) (isWordChar(c) && (unsigned short)(c) < 0x2E80)
 
+static void FoldCodepoints(Str text, int textLen, Vec<int>& out);
+
 static void markAllPagesNonSkip(Vec<bool>& pagesToSkip) {
     for (int i = 0; i < len(pagesToSkip); i++) {
         pagesToSkip[i] = false;
@@ -68,6 +70,7 @@ void TextSearch::Clear() {
     str::FreePtr(&lastText);
     findTextLen = 0;
     anchorLen = 0;
+    VecReset(anchorFolded);
     Reset();
 }
 
@@ -141,6 +144,10 @@ void TextSearch::SetText(Str text) {
         anchorLen = 1;
     } else {
         anchor = {};
+    }
+    VecReset(anchorFolded);
+    if (anchor) {
+        FoldCodepoints(anchor, anchorLen, anchorFolded);
     }
 
     if (str::EndsWith(this->findText, StrL(" "))) {
@@ -329,87 +336,81 @@ static bool IsLatinS(int c) {
     return c != 0 && FoldCaseForSearch(c) == L's';
 }
 
-// Compare needle `n` against haystack `h` for a single search "unit", case-
-// folded, treating ß as equivalent to "ss". On a match returns true and reports
-// how many codepoints were consumed from each side (1:1 normally, but 1:2 / 2:1 for
-// the ß <-> ss equivalence). Safe to call at a string end (reads at most h[1]
-// / n[1], which is the NUL terminator at worst).
-static bool MatchSearchUnit(Str h, int hLen, int hIdx, int hByteIdx, Str n, int nLen, int nIdx, int nByteIdx, int& hAdv,
-                            int& nAdv, int& hByteAdv, int& nByteAdv) {
-    hAdv = nAdv = hByteAdv = nByteAdv = 0;
+// fold every codepoint of `text` once, so the O(n*m) anchor scan below can
+// compare pre-folded ints instead of re-decoding UTF-8 and calling
+// FoldCaseForSearch (a CharLowerW call) at every candidate start position
+static void FoldCodepoints(Str text, int textLen, Vec<int>& out) {
+    VecResize(out, textLen);
+    int byteIdx = 0;
+    for (int i = 0; i < textLen; i++) {
+        int c = Utf8CodepointNext(text, byteIdx);
+        out[i] = FoldCaseForSearch(c);
+    }
+}
+
+// Compare pre-folded needle codepoints `n` against pre-folded haystack
+// codepoints `h` for a single search "unit", treating ß as equivalent to
+// "ss". On a match returns true and reports how many codepoints were
+// consumed from each side (1:1 normally, but 1:2 / 2:1 for the ß <-> ss
+// equivalence).
+static bool MatchSearchUnit(const Vec<int>& h, int hLen, int hIdx, const Vec<int>& n, int nLen, int nIdx, int& hAdv,
+                            int& nAdv) {
+    hAdv = nAdv = 0;
     if (hIdx >= hLen || nIdx >= nLen) {
         return false;
     }
-    int hNextByte = hByteIdx;
-    int hc = Utf8CodepointNext(h, hNextByte);
-    int nNextByte = nByteIdx;
-    int nc = Utf8CodepointNext(n, nNextByte);
+    // h and n hold already-folded codepoints, so compare against the folded
+    // forms directly (0x00DF is ß folded; L's' is 's'/'S' folded) instead of
+    // calling IsSharpS()/IsLatinS(), which would re-fold on every comparison
+    int hc = h[hIdx];
+    int nc = n[nIdx];
     // ß in the needle matches "ss" in the text
-    if (IsSharpS(nc) && hIdx + 1 < hLen && IsLatinS(hc)) {
-        int hAfterNextByte = hNextByte;
-        int hNextChar = Utf8CodepointNext(h, hAfterNextByte);
-        if (IsLatinS(hNextChar)) {
+    if (nc == 0x00DF && hIdx + 1 < hLen && hc == L's') {
+        if (h[hIdx + 1] == L's') {
             hAdv = 2;
             nAdv = 1;
-            hByteAdv = hAfterNextByte - hByteIdx;
-            nByteAdv = nNextByte - nByteIdx;
             return true;
         }
     }
     // "ss" in the needle matches ß in the text
-    if (nIdx + 1 < nLen && IsLatinS(nc) && IsSharpS(hc)) {
-        int nAfterNextByte = nNextByte;
-        int nNextChar = Utf8CodepointNext(n, nAfterNextByte);
-        if (IsLatinS(nNextChar)) {
+    if (nIdx + 1 < nLen && nc == L's' && hc == 0x00DF) {
+        if (n[nIdx + 1] == L's') {
             hAdv = 1;
             nAdv = 2;
-            hByteAdv = hNextByte - hByteIdx;
-            nByteAdv = nAfterNextByte - nByteIdx;
             return true;
         }
     }
     // everything else (including ß~ß and ss~ss) matches one-to-one
-    if (FoldCaseForSearch(hc) == FoldCaseForSearch(nc)) {
+    if (hc == nc) {
         hAdv = 1;
         nAdv = 1;
-        hByteAdv = hNextByte - hByteIdx;
-        nByteAdv = nNextByte - nByteIdx;
         return true;
     }
     return false;
 }
 
-static int StrStrFoldCase(Str haystack, int haystackLen, int startOff, Str needle, int needleLen) {
-    if (!haystack || !needle) {
-        return startOff;
-    }
-    int byteIdx = Utf8CodepointToByteIndex(haystack, startOff);
+static int StrStrFoldCase(const Vec<int>& haystack, int haystackLen, int startOff, const Vec<int>& needle,
+                          int needleLen) {
     for (int i = startOff; i < haystackLen; i++) {
         int hIdx = i;
-        int hByteIdx = byteIdx;
         int nIdx = 0;
-        int nByteIdx = 0;
         bool isMatch = true;
         while (nIdx < needleLen) {
             if (hIdx >= haystackLen) {
                 isMatch = false;
                 break;
             }
-            int hAdv, nAdv, hByteAdv, nByteAdv;
-            if (!MatchSearchUnit(haystack, haystackLen, hIdx, hByteIdx, needle, needleLen, nIdx, nByteIdx, hAdv, nAdv,
-                                 hByteAdv, nByteAdv)) {
+            int hAdv, nAdv;
+            if (!MatchSearchUnit(haystack, haystackLen, hIdx, needle, needleLen, nIdx, hAdv, nAdv)) {
                 isMatch = false;
                 break;
             }
             hIdx += hAdv;
             nIdx += nAdv;
-            hByteIdx += hByteAdv;
-            nByteIdx += nByteAdv;
         }
         if (isMatch) {
             return i;
         }
-        Utf8CodepointNext(haystack, byteIdx);
     }
     return -1;
 }
@@ -437,40 +438,33 @@ static int StrRStr(Str text, int textLen, int endOff, Str needle, int needleLen)
     return result;
 }
 
-static int StrRStrFoldCase(Str text, int textLen, int endOff, Str needle, int needleLen) {
-    if (!text || !needle || endOff <= 0 || endOff > textLen) {
+static int StrRStrFoldCase(const Vec<int>& text, int textLen, int endOff, const Vec<int>& needle, int needleLen) {
+    if (endOff <= 0 || endOff > textLen) {
         return -1;
     }
     // ß <-> ss makes the matched length variable, so scan forward within
     // [start, end) and remember the last start position that matches.
     int result = -1;
-    int byteIdx = 0;
     for (int i = 0; i < endOff; i++) {
         int hIdx = i;
-        int hByteIdx = byteIdx;
         int nIdx = 0;
-        int nByteIdx = 0;
         bool isMatch = true;
         while (nIdx < needleLen) {
             if (hIdx >= endOff) {
                 isMatch = false;
                 break;
             }
-            int hAdv, nAdv, hByteAdv, nByteAdv;
-            if (!MatchSearchUnit(text, textLen, hIdx, hByteIdx, needle, needleLen, nIdx, nByteIdx, hAdv, nAdv, hByteAdv,
-                                 nByteAdv)) {
+            int hAdv, nAdv;
+            if (!MatchSearchUnit(text, textLen, hIdx, needle, needleLen, nIdx, hAdv, nAdv)) {
                 isMatch = false;
                 break;
             }
             hIdx += hAdv;
             nIdx += nAdv;
-            hByteIdx += hByteAdv;
-            nByteIdx += nByteAdv;
         }
         if (isMatch) {
             result = i;
         }
-        Utf8CodepointNext(text, byteIdx);
     }
     return result;
 }
@@ -663,6 +657,13 @@ bool TextSearch::FindTextInPage(int pageNo, TextSearch::PageAndOffset* finalGlyp
     // a findText = engine->GetTextForPage(findPage) here.
     findPage = pageNo;
 
+    // fold pageText's codepoints once per page instead of per candidate
+    // position; only needed for the case-insensitive anchor scan below
+    Vec<int> pageFolded;
+    if (anchor && !matchCase) {
+        FoldCodepoints(pageText, pageTextLen, pageFolded);
+    }
+
     int found = -1;
     PageAndOffset fg;
     for (;;) {
@@ -676,13 +677,13 @@ bool TextSearch::FindTextInPage(int pageNo, TextSearch::PageAndOffset* finalGlyp
                 if (matchCase) {
                     found = StrStr(pageText, pageTextLen, findIndex, anchor, anchorLen);
                 } else {
-                    found = StrStrFoldCase(pageText, pageTextLen, findIndex, anchor, anchorLen);
+                    found = StrStrFoldCase(pageFolded, pageTextLen, findIndex, anchorFolded, anchorLen);
                 }
             } else {
                 if (matchCase) {
                     found = StrRStr(pageText, pageTextLen, findIndex, anchor, anchorLen);
                 } else {
-                    found = StrRStrFoldCase(pageText, pageTextLen, findIndex, anchor, anchorLen);
+                    found = StrRStrFoldCase(pageFolded, pageTextLen, findIndex, anchorFolded, anchorLen);
                 }
             }
             if (found < 0) {
