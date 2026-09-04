@@ -145,7 +145,9 @@ void TextSearch::SetText(Str text) {
     } else {
         anchor = {};
     }
+
     VecReset(anchorFolded);
+
     if (anchor) {
         FoldCodepoints(anchor, anchorLen, anchorFolded);
     }
@@ -326,19 +328,19 @@ static int FoldCaseForSearch(int c) {
     return c;
 }
 
+static const int kSharpS = 0x00DF;
+
 // German ß (sharp s, U+00DF) is spelled "ss" and the two are often used
 // interchangeably, so for case-insensitive search we treat ß as equivalent to
 // "ss" (issue #933). Fold first so capital ẞ (U+1E9E) and case differences work.
 static bool IsSharpS(int c) {
-    return c != 0 && FoldCaseForSearch(c) == 0x00DF;
+    return c != 0 && FoldCaseForSearch(c) == kSharpS;
 }
 static bool IsLatinS(int c) {
     return c != 0 && FoldCaseForSearch(c) == L's';
 }
 
-// fold every codepoint of `text` once, so the O(n*m) anchor scan below can
-// compare pre-folded ints instead of re-decoding UTF-8 and calling
-// FoldCaseForSearch (a CharLowerW call) at every candidate start position
+// case-fold every codepoint of text into out
 static void FoldCodepoints(Str text, int textLen, Vec<int>& out) {
     VecResize(out, textLen);
     int byteIdx = 0;
@@ -348,24 +350,20 @@ static void FoldCodepoints(Str text, int textLen, Vec<int>& out) {
     }
 }
 
-// Compare pre-folded needle codepoints `n` against pre-folded haystack
-// codepoints `h` for a single search "unit", treating ß as equivalent to
-// "ss". On a match returns true and reports how many codepoints were
-// consumed from each side (1:1 normally, but 1:2 / 2:1 for the ß <-> ss
-// equivalence).
+// Compare one search "unit" of case-folded needle n against case-folded
+// haystack h, treating ß as equivalent to "ss". On a match reports how many
+// codepoints each side consumed (1:1, or 1:2 / 2:1 for ß <-> ss).
 static bool MatchSearchUnit(const Vec<int>& h, int hLen, int hIdx, const Vec<int>& n, int nLen, int nIdx, int& hAdv,
                             int& nAdv) {
     hAdv = nAdv = 0;
     if (hIdx >= hLen || nIdx >= nLen) {
         return false;
     }
-    // h and n hold already-folded codepoints, so compare against the folded
-    // forms directly (0x00DF is ß folded; L's' is 's'/'S' folded) instead of
-    // calling IsSharpS()/IsLatinS(), which would re-fold on every comparison
+    // h and n are already case-folded
     int hc = h[hIdx];
     int nc = n[nIdx];
     // ß in the needle matches "ss" in the text
-    if (nc == 0x00DF && hIdx + 1 < hLen && hc == L's') {
+    if (nc == kSharpS && hIdx + 1 < hLen && hc == L's') {
         if (h[hIdx + 1] == L's') {
             hAdv = 2;
             nAdv = 1;
@@ -373,7 +371,7 @@ static bool MatchSearchUnit(const Vec<int>& h, int hLen, int hIdx, const Vec<int
         }
     }
     // "ss" in the needle matches ß in the text
-    if (nIdx + 1 < nLen && nc == L's' && hc == 0x00DF) {
+    if (nIdx + 1 < nLen && nc == L's' && hc == kSharpS) {
         if (n[nIdx + 1] == L's') {
             hAdv = 1;
             nAdv = 2;
@@ -657,8 +655,7 @@ bool TextSearch::FindTextInPage(int pageNo, TextSearch::PageAndOffset* finalGlyp
     // a findText = engine->GetTextForPage(findPage) here.
     findPage = pageNo;
 
-    // fold pageText's codepoints once per page instead of per candidate
-    // position; only needed for the case-insensitive anchor scan below
+    // Perform case folding on the page text once in bulk.
     Vec<int> pageFolded;
     if (anchor && !matchCase) {
         FoldCodepoints(pageText, pageTextLen, pageFolded);
