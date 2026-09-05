@@ -1661,6 +1661,14 @@ inline void VecUseExternalBuffer(Vec<T>& v, T (&buf)[N]) {
 
 template <typename T>
 bool VecAppend(Vec<T>& v, const VecIdentityT<T>& el) {
+    // room left in owned (or borrowed) storage: store in place. Slots past len
+    // are always zero (VecRemoveAtN re-zeroes what it frees), so this keeps the
+    // same padding the out-of-line path leaves.
+    int cap = v.cap < 0 ? -v.cap : v.cap;
+    if (v.els && v.len < cap) {
+        v.els[v.len++] = el;
+        return true;
+    }
     return VecInsertAt(v, v.len, el);
 }
 
