@@ -7503,14 +7503,46 @@ static PageText ExtractPageTextLocked(EngineMupdf* e, FzPageInfo* pageInfo) {
     return res;
 }
 
+// true if the page's fz_page is already loaded (caller holds pagesLock)
+static bool HasLoadedPage(EngineMupdf* e, Location loc) {
+    if (!loc.IsValid() || !e->IsChapterLaidOut(loc.chapter)) {
+        return false;
+    }
+    FzPageInfo* pi = e->PageInfoByLoc(loc);
+    return pi && pi->page;
+}
+
+// Drop a page that was loaded only to extract its text. MuPDF keeps every open
+// page on a list that fz_load_chapter_page walks (twice) on each load, so
+// holding all pages of a large document made loading the next one O(pages).
+// Annotation wrappers reference objects owned by the page, so keep it if any
+// were created; a later render just reloads the page (~0.2 ms).
+static void DropSearchOnlyPage(EngineMupdf* e, FzPageInfo* pi) {
+    if (!e->pdfdoc || !pi->page || pi->fullyLoaded || pi->displayList) {
+        return;
+    }
+    if (len(pi->annotations) > 0 || len(pi->widgets) > 0) {
+        return;
+    }
+    fz_drop_page(e->Ctx(), pi->page);
+    pi->page = nullptr;
+    pi->annotsLoaded = false;
+}
+
 PageText EngineMupdf::ExtractPageText(int pageNo) {
     ScopedRecursiveMutex pagesScope(&pagesLock);
     ScopedMutex renderScope(&renderLock);
-    FzPageInfo* pageInfo = GetFzPageInfoLocked(this, LocationFromPageNo(pageNo), true, nullptr);
+    Location loc = LocationFromPageNo(pageNo);
+    bool hadPage = HasLoadedPage(this, loc);
+    FzPageInfo* pageInfo = GetFzPageInfoLocked(this, loc, true, nullptr);
     if (!pageInfo) {
         return {};
     }
-    return ExtractPageTextLocked(this, pageInfo);
+    PageText res = ExtractPageTextLocked(this, pageInfo);
+    if (!hadPage) {
+        DropSearchOnlyPage(this, pageInfo);
+    }
+    return res;
 }
 
 bool EngineMupdf::TryExtractPageText(int pageNo, PageText* out) {
@@ -7521,7 +7553,9 @@ bool EngineMupdf::TryExtractPageText(int pageNo, PageText* out) {
         pagesLock.Unlock();
         return false;
     }
-    FzPageInfo* pageInfo = GetFzPageInfoLocked(this, LocationFromPageNo(pageNo), true, nullptr);
+    Location loc = LocationFromPageNo(pageNo);
+    bool hadPage = HasLoadedPage(this, loc);
+    FzPageInfo* pageInfo = GetFzPageInfoLocked(this, loc, true, nullptr);
     if (!pageInfo) {
         renderLock.Unlock();
         pagesLock.Unlock();
@@ -7529,6 +7563,9 @@ bool EngineMupdf::TryExtractPageText(int pageNo, PageText* out) {
         return true;
     }
     *out = ExtractPageTextLocked(this, pageInfo);
+    if (!hadPage) {
+        DropSearchOnlyPage(this, pageInfo);
+    }
     renderLock.Unlock();
     pagesLock.Unlock();
     return true;
