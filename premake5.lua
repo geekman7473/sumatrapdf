@@ -935,6 +935,9 @@ workspace "SumatraPDF"
     kind "StaticLib"
     language "C"
     mixed_dbg_rel_conf()
+    -- the PDF interpreter is CPU-bound (text extraction / rendering); /O2
+    -- measured 12% faster for +1.2 MB of dll
+    favor_speed()
     -- for openjpeg, OPJ_STATIC is alrady defined in load-jpx.c
     -- so we can't double-define it
     defines { "USE_JPIP", "OPJ_EXPORTS", "HAVE_LCMS2MT=1", "HAVE_WEBP=1" }
