@@ -897,7 +897,18 @@ struct SeenGlyph {
     RectF r;
 };
 
-static bool HasSeenGlyph(const Vec<SeenGlyph>& seen, int rune, const RectF& r) {
+// glyphs already emitted for the current line, for duplicate detection
+struct SeenGlyphs {
+    Vec<SeenGlyph> glyphs;
+    float maxX1 = -FLT_MAX; // right edge of the rightmost glyph so far
+};
+
+static void ResetSeenGlyphs(SeenGlyphs& seen) {
+    VecClear(seen.glyphs);
+    seen.maxX1 = -FLT_MAX;
+}
+
+static bool HasSeenGlyph(const SeenGlyphs& seen, int rune, const RectF& r) {
     // A "duplicate" glyph is one drawn on top of an earlier one (e.g. faux-bold
     // double-strike or an overprinted shadow); its box overlaps the earlier one
     // almost entirely. Two *adjacent* identical letters (e.g. the "ll" in
@@ -911,7 +922,12 @@ static bool HasSeenGlyph(const Vec<SeenGlyph>& seen, int rune, const RectF& r) {
     if (area <= 0) {
         return false;
     }
-    for (const SeenGlyph& glyph : seen) {
+    // a glyph starting at or past every seen glyph's right edge overlaps none of
+    // them; left-to-right text takes this exit for nearly every glyph
+    if (r.x >= seen.maxX1) {
+        return false;
+    }
+    for (const SeenGlyph& glyph : seen.glyphs) {
         if (glyph.rune != rune) {
             continue;
         }
@@ -929,8 +945,9 @@ static bool HasSeenGlyph(const Vec<SeenGlyph>& seen, int rune, const RectF& r) {
     return false;
 }
 
-static void AddSeenGlyph(Vec<SeenGlyph>& seen, int rune, const RectF& r) {
-    VecAppend(seen, {rune, r});
+static void AddSeenGlyph(SeenGlyphs& seen, int rune, const RectF& r) {
+    VecAppend(seen.glyphs, {rune, r});
+    seen.maxX1 = std::max(seen.maxX1, r.x + r.dx);
 }
 
 // True Unicode scalar (not surrogate, not out of range). fz_runetochar will still
@@ -986,10 +1003,22 @@ static bool IsTrackingSpace(const fz_stext_char* space, const fz_stext_char* nex
     return gap < size * 0.1f;
 }
 
-struct GlyphBox {
-    Rect rect;
-    QuadF quad;
+// per-codepoint glyph boxes of the page text being built; rect i and quad i
+// belong to codepoint i
+struct GlyphBoxes {
+    Vec<Rect> rects;
+    Vec<QuadF> quads;
 };
+
+static void AppendGlyphBox(GlyphBoxes& boxes, const Rect& r, const QuadF& q) {
+    VecAppend(boxes.rects, r);
+    VecAppend(boxes.quads, q);
+}
+
+static void RemoveLastGlyphBox(GlyphBoxes& boxes) {
+    VecRemoveLast(boxes.rects);
+    VecRemoveLast(boxes.quads);
+}
 
 static QuadF QuadFromFz(const fz_quad& q) {
     QuadF r;
@@ -1000,29 +1029,49 @@ static QuadF QuadFromFz(const fz_quad& q) {
     return r;
 }
 
-static GlyphBox BoxFromChar(fz_stext_char* c) {
-    GlyphBox b;
-    b.rect = ToRectF(fz_rect_from_quad(c->quad)).Round();
-    b.quad = QuadFromFz(c->quad);
-    return b;
+// bounding box of a glyph quad. Same result as ToRectF(fz_rect_from_quad()) but
+// inline; that is a call into libsumatrapdf.dll for every glyph on every page
+// true if every coordinate is finite: the exponent field of a NaN or an
+// infinity is all ones. isfinite() is an out-of-line CRT call per float here.
+static bool IsFiniteQuad(const fz_quad& q) {
+    const float coords[8] = {q.ul.x, q.ul.y, q.ur.x, q.ur.y, q.ll.x, q.ll.y, q.lr.x, q.lr.y};
+    u32 nonFinite = 0;
+    for (float f : coords) {
+        u32 bits;
+        memcpy(&bits, &f, sizeof(bits));
+        nonFinite |= ((bits & 0x7f800000u) == 0x7f800000u) ? 1u : 0u;
+    }
+    return nonFinite == 0;
 }
 
-static void AddCharUtf8(fz_stext_line* /*line*/, fz_stext_char* c, str::Builder& s, Vec<GlyphBox>& boxes,
-                        Vec<SeenGlyph>& seen) {
-    GlyphBox box = BoxFromChar(c);
-    RectF rf = ToRectF(fz_rect_from_quad(c->quad));
+static RectF RectFFromFzQuad(const fz_quad& q) {
+    if (!IsFiniteQuad(q)) {
+        return ToRectF(fz_rect_from_quad(q));
+    }
+    float x0 = std::min(std::min(q.ll.x, q.lr.x), std::min(q.ul.x, q.ur.x));
+    float y0 = std::min(std::min(q.ll.y, q.lr.y), std::min(q.ul.y, q.ur.y));
+    float x1 = std::max(std::max(q.ll.x, q.lr.x), std::max(q.ul.x, q.ur.x));
+    float y1 = std::max(std::max(q.ll.y, q.lr.y), std::max(q.ul.y, q.ur.y));
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+static void AddCharUtf8(fz_stext_line* /*line*/, fz_stext_char* c, str::Builder& s, GlyphBoxes& boxes,
+                        SeenGlyphs& seen) {
+    RectF rf = RectFFromFzQuad(c->quad);
     int rune = c->c;
     if (HasSeenGlyph(seen, rune, rf)) {
         return;
     }
+    Rect rect = rf.Round();
+    QuadF quad = QuadFromFz(c->quad);
 
     bool isWhitespace = rune > 0 && rune <= 0x7f && str::IsWs((char)rune);
     bool isNonPrintable = rune <= 32 || (rune <= 0xffff && wstr::IsNonCharacter((WCHAR)rune));
-    // Invalid scalars (surrogates / out of range) must not go through fz_runetochar:
+    // Invalid scalars (surrogates / out of range) must not be UTF-8 encoded:
     // that produces illegal UTF-8 that Utf8CodepointCount splits into multiple units.
     if (!IsUnicodeScalar(rune) || (isNonPrintable && !isWhitespace)) {
         s.AppendChar('?');
-        VecAppend(boxes, box);
+        AppendGlyphBox(boxes, rect, quad);
         AddSeenGlyph(seen, rune, rf);
         return;
     }
@@ -1033,21 +1082,22 @@ static void AddCharUtf8(fz_stext_line* /*line*/, fz_stext_char* c, str::Builder&
             return;
         }
         s.AppendChar(' ');
-        VecAppend(boxes, box);
+        AppendGlyphBox(boxes, rect, quad);
         AddSeenGlyph(seen, rune, rf);
         return;
     }
     char buf[4];
-    int n = fz_runetochar(buf, rune);
+    int n = 0;
+    str::Utf8Encode(buf, n, rune);
     // One Unicode scalar → one UTF-8 sequence → one rect (codepoint-aligned coords)
-    if (n <= 0 || !s.Append(Str(buf, n))) {
+    if (!s.Append(Str(buf, n))) {
         return;
     }
-    VecAppend(boxes, box);
+    AppendGlyphBox(boxes, rect, quad);
     AddSeenGlyph(seen, rune, rf);
 }
 
-static void AddLineSepUtf8(str::Builder& s, Vec<GlyphBox>& boxes, Str lineSep) {
+static void AddLineSepUtf8(str::Builder& s, GlyphBoxes& boxes, Str lineSep) {
     size_t lineSepLen = (size_t)lineSep.len;
     if (lineSepLen == 0) {
         return;
@@ -1055,11 +1105,11 @@ static void AddLineSepUtf8(str::Builder& s, Vec<GlyphBox>& boxes, Str lineSep) {
     // remove trailing space
     if (len(s) > 0 && s.LastChar() == ' ') {
         s.RemoveLast();
-        VecRemoveLast(boxes);
+        RemoveLastGlyphBox(boxes);
     }
     s.Append(lineSep);
     for (size_t i = 0; i < lineSepLen; i++) {
-        VecAppend(boxes, GlyphBox{});
+        AppendGlyphBox(boxes, Rect{}, QuadF{});
     }
 }
 
@@ -1116,8 +1166,8 @@ static bool IsUnicodeHyphenRune(int c) {
 // Drop a trailing hyphen used for line wrapping before joining the next line
 // so "some-\\nthing" becomes "something" (#5793, #1189). Handles multi-byte
 // UTF-8 hyphens (U+00AD soft hyphen, U+2010/U+2011), not just ASCII '-'.
-static void MaybeDropTrailingSoftHyphen(str::Builder& s, Vec<GlyphBox>& boxes) {
-    if (len(s) == 0 || len(boxes) == 0) {
+static void MaybeDropTrailingSoftHyphen(str::Builder& s, GlyphBoxes& boxes) {
+    if (len(s) == 0 || len(boxes.rects) == 0) {
         return;
     }
     Str text = ToStr(s);
@@ -1131,11 +1181,11 @@ static void MaybeDropTrailingSoftHyphen(str::Builder& s, Vec<GlyphBox>& boxes) {
     while (dropBytes-- > 0) {
         s.RemoveLast();
     }
-    VecRemoveLast(boxes);
+    RemoveLastGlyphBox(boxes);
 }
 
-static void AppendStextTextBlock(const fz_stext_block* block, str::Builder& content, Vec<GlyphBox>& boxes,
-                                 Vec<SeenGlyph>& seen, Str hardLineSep, Str softLineSep) {
+static void AppendStextTextBlock(const fz_stext_block* block, str::Builder& content, GlyphBoxes& boxes,
+                                 SeenGlyphs& seen, Str hardLineSep, Str softLineSep) {
     fz_stext_line* line = block->u.t.first_line;
     while (line) {
         // Walk each line so tracking spaces can be dropped (issue #5627:
@@ -1200,12 +1250,12 @@ static void AppendStextTextBlock(const fz_stext_block* block, str::Builder& cont
             AddLineSepUtf8(content, boxes, hardLineSep);
         }
         // each line has independent glyph positions; reset duplicate detection
-        VecReset(seen);
+        ResetSeenGlyphs(seen);
         line = line->next;
     }
 }
 
-static void AppendStextBlocks(fz_stext_block* block, str::Builder& content, Vec<GlyphBox>& boxes, Vec<SeenGlyph>& seen,
+static void AppendStextBlocks(fz_stext_block* block, str::Builder& content, GlyphBoxes& boxes, SeenGlyphs& seen,
                               Str hardLineSep, Str softLineSep) {
     while (block) {
         if (block->type == FZ_STEXT_BLOCK_TEXT) {
@@ -1219,28 +1269,56 @@ static void AppendStextBlocks(fz_stext_block* block, str::Builder& content, Vec<
     }
 }
 
-static Str FzTextPageToUtf8(fz_stext_page* text, Rect** coordsOut, QuadF** quadsOut = nullptr) {
+// upper bound on the codepoints a page will produce: every char plus a line
+// separator per line (dropped duplicates / tracking spaces only make it smaller)
+static int CountStextCodepoints(const fz_stext_block* block) {
+    int n = 0;
+    for (; block; block = block->next) {
+        if (block->type == FZ_STEXT_BLOCK_STRUCT && block->u.s.down) {
+            n += CountStextCodepoints(block->u.s.down->first_block);
+            continue;
+        }
+        if (block->type != FZ_STEXT_BLOCK_TEXT) {
+            continue;
+        }
+        for (const fz_stext_line* line = block->u.t.first_line; line; line = line->next) {
+            n++;
+            for (const fz_stext_char* c = line->first_char; c; c = c->next) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+// nCodepointsOut receives the number of codepoints in the returned text, which
+// is also the number of entries in coordsOut / quadsOut
+static Str FzTextPageToUtf8(fz_stext_page* text, Rect** coordsOut, QuadF** quadsOut = nullptr,
+                            int* nCodepointsOut = nullptr) {
     Str hardLineSep = StrL("\n");
     Str softLineSep = StrL(" ");
     str::Builder content;
-    Vec<GlyphBox> boxes;
-    Vec<SeenGlyph> seen;
+    GlyphBoxes boxes;
+    SeenGlyphs seen;
+
+    // reserve once so appending a glyph never reallocates and copies
+    int estimate = CountStextCodepoints(text->first_block);
+    if (estimate > 0) {
+        VecReserve(content, estimate + estimate / 4);
+        VecReserve(boxes.rects, estimate);
+        VecReserve(boxes.quads, estimate);
+    }
 
     AppendStextBlocks(text->first_block, content, boxes, seen, hardLineSep, softLineSep);
 
-    ReportIf(Utf8CodepointCount(ToStr(content)) != len(boxes));
+    int n = len(boxes.rects);
+    ReportIf(Utf8CodepointCount(ToStr(content)) != n);
+    if (nCodepointsOut) {
+        *nCodepointsOut = n;
+    }
 
-    int n = len(boxes);
     if (coordsOut) {
-        if (n > 0) {
-            Rect* rects = AllocArray<Rect>(n);
-            for (int i = 0; i < n; i++) {
-                rects[i] = boxes[i].rect;
-            }
-            *coordsOut = rects;
-        } else {
-            *coordsOut = nullptr;
-        }
+        *coordsOut = n > 0 ? VecTake(boxes.rects) : nullptr;
     }
     if (quadsOut) {
         // quads (32 bytes/glyph, cached for the engine's lifetime) only add
@@ -1248,17 +1326,9 @@ static Str FzTextPageToUtf8(fz_stext_page* text, Rect** coordsOut, QuadF** quads
         // coords when null, so skip them for the common all-upright page
         bool hasRotated = false;
         for (int i = 0; !hasRotated && i < n; i++) {
-            hasRotated = boxes[i].quad.IsRotated();
+            hasRotated = boxes.quads[i].IsRotated();
         }
-        if (hasRotated) {
-            QuadF* quads = AllocArray<QuadF>(n);
-            for (int i = 0; i < n; i++) {
-                quads[i] = boxes[i].quad;
-            }
-            *quadsOut = quads;
-        } else {
-            *quadsOut = nullptr;
-        }
+        *quadsOut = hasRotated ? VecTake(boxes.quads) : nullptr;
     }
     return content.TakeStr();
 }
@@ -7427,10 +7497,9 @@ static PageText ExtractPageTextLocked(EngineMupdf* e, FzPageInfo* pageInfo) {
         return {};
     }
     PageText res;
-    res.text = FzTextPageToUtf8(stext, &res.coords, &res.quads);
+    res.text = FzTextPageToUtf8(stext, &res.coords, &res.quads, &res.nCodepoints);
     fz_drop_stext_page(ctx, stext);
     res.len = res.text.len;
-    res.nCodepoints = Utf8CodepointCount(res.text);
     return res;
 }
 
