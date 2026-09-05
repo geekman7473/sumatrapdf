@@ -357,18 +357,26 @@ static bool IsLatinS(int c) {
 // case-fold every codepoint of text into out
 static void FoldCodepoints(Str text, int textLen, Vec<int>& out) {
     VecResize(out, textLen);
+    int* cps = out.els;
     int byteIdx = 0;
     for (int i = 0; i < textLen; i++) {
-        int c = Utf8CodepointNext(text, byteIdx);
-        out[i] = FoldCaseForSearch(c);
+        // ASCII is a single byte and most page text; skip the decoder call
+        int c = (u8)text.s[byteIdx];
+        if (c < 0x80) {
+            byteIdx++;
+        } else {
+            c = Utf8CodepointNext(text, byteIdx);
+        }
+        cps[i] = FoldCaseForSearch(c);
     }
 }
 
 // Compare one search "unit" of case-folded needle n against case-folded
 // haystack h, treating ß as equivalent to "ss". On a match reports how many
 // codepoints each side consumed (1:1, or 1:2 / 2:1 for ß <-> ss).
-static bool MatchSearchUnit(const Vec<int>& h, int hLen, int hIdx, const Vec<int>& n, int nLen, int nIdx, int& hAdv,
-                            int& nAdv) {
+// h and n are raw codepoint arrays (Vec::els): this runs for every candidate
+// position of every page, and operator[] bounds checks were a quarter of it
+static bool MatchSearchUnit(const int* h, int hLen, int hIdx, const int* n, int nLen, int nIdx, int& hAdv, int& nAdv) {
     hAdv = nAdv = 0;
     if (hIdx >= hLen || nIdx >= nLen) {
         return false;
@@ -401,8 +409,10 @@ static bool MatchSearchUnit(const Vec<int>& h, int hLen, int hIdx, const Vec<int
     return false;
 }
 
-static int StrStrFoldCase(const Vec<int>& haystack, int haystackLen, int startOff, const Vec<int>& needle,
+static int StrStrFoldCase(const Vec<int>& haystackVec, int haystackLen, int startOff, const Vec<int>& needleVec,
                           int needleLen) {
+    const int* haystack = haystackVec.els;
+    const int* needle = needleVec.els;
     for (int i = startOff; i < haystackLen; i++) {
         int hIdx = i;
         int nIdx = 0;
@@ -450,10 +460,12 @@ static int StrRStr(Str text, int textLen, int endOff, Str needle, int needleLen)
     return result;
 }
 
-static int StrRStrFoldCase(const Vec<int>& text, int textLen, int endOff, const Vec<int>& needle, int needleLen) {
+static int StrRStrFoldCase(const Vec<int>& textVec, int textLen, int endOff, const Vec<int>& needleVec, int needleLen) {
     if (endOff <= 0 || endOff > textLen) {
         return -1;
     }
+    const int* text = textVec.els;
+    const int* needle = needleVec.els;
     // ß <-> ss makes the matched length variable, so scan forward within
     // [start, end) and remember the last start position that matches.
     int result = -1;
