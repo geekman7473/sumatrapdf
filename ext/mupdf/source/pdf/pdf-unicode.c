@@ -45,12 +45,32 @@ pdf_remap_cmap_range(fz_context *ctx, pdf_cmap *ucs_from_gid,
 	}
 }
 
+/* True if the cmap maps every code to itself (e.g. Identity-H/V), so that
+ * remapping a ToUnicode cmap through it would reproduce that cmap unchanged. */
+static int
+pdf_cmap_is_identity(pdf_cmap *cmap)
+{
+	int i;
+
+	if (cmap->usecmap || cmap->xlen != 0 || cmap->mlen != 0)
+		return 0;
+	for (i = 0; i < cmap->rlen; ++i)
+		if (cmap->ranges[i].out != cmap->ranges[i].low)
+			return 0;
+	return 1;
+}
+
 static pdf_cmap *
 pdf_remap_cmap(fz_context *ctx, pdf_cmap *gid_from_cpt, pdf_cmap *ucs_from_cpt)
 {
 	pdf_cmap *ucs_from_gid;
 	unsigned int a, b, x;
 	int i;
+
+	/* Identity encodings cover the whole 16-bit code space, so the remap below
+	 * would do 65536 lookups per font only to rebuild ucs_from_cpt. */
+	if (pdf_cmap_is_identity(gid_from_cpt))
+		return pdf_keep_cmap(ctx, ucs_from_cpt);
 
 	ucs_from_gid = pdf_new_cmap(ctx);
 

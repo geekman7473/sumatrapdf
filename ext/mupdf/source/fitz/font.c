@@ -146,7 +146,8 @@ fz_new_font(fz_context *ctx, const char *name, int use_glyph_bbox, int glyph_cou
 fz_font *
 fz_keep_font(fz_context *ctx, fz_font *font)
 {
-	return fz_keep_imp(ctx, font, &font->refs);
+	/* fonts are not storables, so their refs never meet the store's lock */
+	return fz_keep_imp_atomic(ctx, font, &font->refs);
 }
 
 static void
@@ -203,7 +204,7 @@ fz_drop_font(fz_context *ctx, fz_font *font)
 	int fterr;
 	int i;
 
-	if (!fz_drop_imp(ctx, font, &font->refs))
+	if (!fz_drop_imp_atomic(ctx, font, &font->refs))
 		return;
 
 	free_resources(ctx, font);

@@ -227,6 +227,15 @@ fz_drop_context(fz_context *ctx)
 
 	assert(ctx->error.top == ctx->error.stack_base);
 
+	/* Recycled small objects (see pdf_new_int); next pointer at offset 0. */
+	while (ctx->num_obj_freelist)
+	{
+		void *next = *(void **)ctx->num_obj_freelist;
+		ctx->alloc.free(ctx->alloc.user, ctx->num_obj_freelist);
+		ctx->num_obj_freelist = next;
+	}
+	ctx->num_obj_freelist_len = 0;
+
 	/* Free the context itself */
 	if (ctx->master == ctx && ctx->context_count != 0)
 	{
@@ -339,6 +348,10 @@ fz_clone_context(fz_context *ctx)
 
 	/* Reset error context to initial state. */
 	fz_init_error_context(new_ctx);
+
+	/* The recycled-object list is per context, not shared with the clone. */
+	new_ctx->num_obj_freelist = NULL;
+	new_ctx->num_obj_freelist_len = 0;
 
 	/* Then keep lock checking happy by keeping shared contexts with new context */
 	fz_keep_document_handler_context(new_ctx);

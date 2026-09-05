@@ -1,0 +1,23 @@
+fitz: grow text spans geometrically
+
+fz_grow_text_span added a fixed 36 items per growth, so a span of n glyphs
+was reallocated (and copied) n/36 times: O(n^2 / 36) memcpy for long text
+runs, visible as realloc traffic in a text-extraction profile. Double the
+capacity instead (minimum 36).
+---
+diff --git a/source/fitz/text.c b/source/fitz/text.c
+index ce0e9cda5..93bbf9300 100644
+--- a/source/fitz/text.c
++++ b/source/fitz/text.c
+@@ -103,8 +103,10 @@ fz_grow_text_span(fz_context *ctx, fz_text_span *span, int n)
+ 	int new_cap = span->cap;
+ 	if (span->len + n < new_cap)
+ 		return;
++	/* Grow geometrically: a fixed +36 meant a realloc (and copy) every 36
++	 * glyphs, so a long span cost O(n^2 / 36) in memcpy. */
+ 	while (span->len + n > new_cap)
+-		new_cap = new_cap + 36;
++		new_cap = new_cap < 36 ? 36 : new_cap * 2;
+ 	span->items = fz_realloc_array(ctx, span->items, new_cap, fz_text_item);
+ 	span->cap = new_cap;
+ }

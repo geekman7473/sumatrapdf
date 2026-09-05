@@ -95,10 +95,30 @@ static int cmpv(const void *a0, const void *b0)
 void
 pdf_end_hmtx(fz_context *ctx, pdf_font_desc *font)
 {
+	int i, c, n;
+
 	if (!font->hmtx)
 		return;
 	qsort(font->hmtx, font->hmtx_len, sizeof(pdf_hmtx), cmph);
 	font->size += font->hmtx_cap * sizeof(pdf_hmtx);
+
+	/* Flatten the sorted ranges into a cid-indexed table: pdf_lookup_hmtx runs
+	 * once per glyph shown, and a load beats a binary search. Overlapping
+	 * ranges (malformed /W) resolve to the last one in sorted order. Built
+	 * once at font load, read-only afterwards, so safe to share between
+	 * threads. At most 64K ints. */
+	n = font->hmtx[font->hmtx_len - 1].hi + 1;
+	font->hmtx_flat = Memento_label(fz_malloc_array(ctx, n, int), "hmtx_flat");
+	for (i = 0; i < n; i++)
+		font->hmtx_flat[i] = PDF_HMTX_UNSET;
+	for (i = 0; i < font->hmtx_len; i++)
+	{
+		int hi = font->hmtx[i].hi < n - 1 ? font->hmtx[i].hi : n - 1;
+		for (c = font->hmtx[i].lo; c <= hi; c++)
+			font->hmtx_flat[c] = font->hmtx[i].w;
+	}
+	font->hmtx_flat_len = n;
+	font->size += n * sizeof(int);
 }
 
 void
@@ -116,6 +136,16 @@ pdf_lookup_hmtx(fz_context *ctx, pdf_font_desc *font, int cid)
 	int l = 0;
 	int r = font->hmtx_len - 1;
 	int m;
+
+	if (font->hmtx_flat)
+	{
+		pdf_hmtx h;
+		if (cid < 0 || cid >= font->hmtx_flat_len || font->hmtx_flat[cid] == PDF_HMTX_UNSET)
+			return font->dhmtx;
+		h.lo = h.hi = (unsigned short)cid;
+		h.w = font->hmtx_flat[cid];
+		return h;
+	}
 
 	if (!font->hmtx)
 		goto notfound;

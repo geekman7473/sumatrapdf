@@ -1,0 +1,52 @@
+tounicode: skip the encoding remap for Identity-H/V fonts
+
+pdf_load_to_unicode builds the cid->unicode cmap by remapping the ToUnicode
+cmap through the font's encoding cmap: pdf_remap_cmap walks every code of
+every range of the encoding and looks each one up in ToUnicode. For an
+Identity encoding that is one range covering 0..0xffff, so loading one CID
+font costs 65536 pdf_lookup_cmap_full calls (~40 ms) only to reproduce the
+ToUnicode cmap unchanged, since cid == code. A 36-font manual spent 2.6 s of
+a 20 s first search in this loop (xperf, native ARM64 build).
+
+Return a reference to the ToUnicode cmap itself when the encoding maps every
+code to itself. Lookups by cid give the same result; only the codespace of
+the returned cmap differs, and to_unicode is never used for decoding.
+---
+diff --git a/source/pdf/pdf-unicode.c b/source/pdf/pdf-unicode.c
+index 7387435ef..da02c35c8 100644
+--- a/source/pdf/pdf-unicode.c
++++ b/source/pdf/pdf-unicode.c
+@@ -45,6 +45,21 @@ pdf_remap_cmap_range(fz_context *ctx, pdf_cmap *ucs_from_gid,
+ 	}
+ }
+ 
++/* True if the cmap maps every code to itself (e.g. Identity-H/V), so that
++ * remapping a ToUnicode cmap through it would reproduce that cmap unchanged. */
++static int
++pdf_cmap_is_identity(pdf_cmap *cmap)
++{
++	int i;
++
++	if (cmap->usecmap || cmap->xlen != 0 || cmap->mlen != 0)
++		return 0;
++	for (i = 0; i < cmap->rlen; ++i)
++		if (cmap->ranges[i].out != cmap->ranges[i].low)
++			return 0;
++	return 1;
++}
++
+ static pdf_cmap *
+ pdf_remap_cmap(fz_context *ctx, pdf_cmap *gid_from_cpt, pdf_cmap *ucs_from_cpt)
+ {
+@@ -52,6 +67,11 @@ pdf_remap_cmap(fz_context *ctx, pdf_cmap *gid_from_cpt, pdf_cmap *ucs_from_cpt)
+ 	unsigned int a, b, x;
+ 	int i;
+ 
++	/* Identity encodings cover the whole 16-bit code space, so the remap below
++	 * would do 65536 lookups per font only to rebuild ucs_from_cpt. */
++	if (pdf_cmap_is_identity(gid_from_cpt))
++		return pdf_keep_cmap(ctx, ucs_from_cpt);
++
+ 	ucs_from_gid = pdf_new_cmap(ctx);
+ 
+ 	fz_try(ctx)

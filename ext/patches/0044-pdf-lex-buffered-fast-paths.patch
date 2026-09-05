@@ -1,0 +1,110 @@
+pdf: buffered fast paths in the content-stream lexer
+
+With fz_read_byte inlinable (0040) the lexer's remaining cost is structural:
+a read (and often an unread) per byte, and tokens copied into the scratch
+buffer byte by byte. Content streams are mostly whitespace, integers and
+short operator names, so:
+
+- lex_white skips whitespace directly in the stream buffer and only falls
+  back to the byte loop when it reaches the buffer end.
+- lex_number, for a run of digits terminated by whitespace or a delimiter
+  that is already buffered, accumulates the value while scanning (the same
+  wrapping uint64 arithmetic as fast_atoi) and returns PDF_TOK_INT.
+- lex_name, for a run of regular bytes with no '#' escape ending in buffered
+  whitespace or a delimiter, memcpy's it into the scratch in one go.
+
+Signs, '.', '#', a run touching the buffer end or the scratch limit, or any
+other terminator take the unchanged general paths, so tokens are identical.
+---
+diff --git a/source/pdf/pdf-lex.c b/source/pdf/pdf-lex.c
+index aaee6aff8..2ca4d23b5 100644
+--- a/source/pdf/pdf-lex.c
++++ b/source/pdf/pdf-lex.c
+@@ -80,6 +80,17 @@ static inline int iswhite(int ch)
+ 		ch == '\040';
+ }
+ 
++/* the IS_DELIM set as a predicate */
++static inline int isdelim(int ch)
++{
++	return
++		ch == '(' || ch == ')' ||
++		ch == '<' || ch == '>' ||
++		ch == '[' || ch == ']' ||
++		ch == '{' || ch == '}' ||
++		ch == '/' || ch == '%';
++}
++
+ static inline int fz_isprint(int ch)
+ {
+ 	return ch >= ' ' && ch <= '~';
+@@ -97,6 +108,12 @@ static void
+ lex_white(fz_context *ctx, fz_stream *f)
+ {
+ 	int c;
++	/* Skip whitespace that is already buffered without a read/unread per
++	 * byte; only the refill / EOF case needs the byte-at-a-time loop. */
++	while (f->rp < f->wp && iswhite(*f->rp))
++		f->rp++;
++	if (f->rp < f->wp)
++		return;
+ 	do {
+ 		c = lex_byte(ctx, f);
+ 	} while ((c <= 32) && (iswhite(c)));
+@@ -195,6 +212,30 @@ lex_number(fz_context *ctx, fz_stream *f, pdf_lexbuf *buf, int c)
+ 	int neg = (c == '-');
+ 	int isbad = 0;
+ 
++	if (c >= '0' && c <= '9')
++	{
++		/* Fast path for the common case: an unsigned integer whose digits and
++		 * terminating delimiter / whitespace are all in the buffer. The value
++		 * is accumulated while scanning, exactly as fast_atoi does (overflow
++		 * deliberately ignored). Signs, '.', a run reaching the buffer end or
++		 * the scratch limit, or any other terminator take the general path. */
++		unsigned char *p = f->rp;
++		unsigned char *end = f->wp;
++		uint64_t v = (uint64_t)(c - '0');
++		while (p < end && *p >= '0' && *p <= '9')
++			v = v * 10 + (uint64_t)(*p++ - '0');
++		if (p < end && (iswhite(*p) || isdelim(*p)) && (size_t)(p - f->rp) + 2 <= (size_t)buf->size)
++		{
++			size_t n = (size_t)(p - f->rp);
++			s[0] = (char)c;
++			memcpy(s + 1, f->rp, n);
++			s[n + 1] = '\0';
++			f->rp = p;
++			buf->i = (int64_t)v;
++			return PDF_TOK_INT;
++		}
++	}
++
+ 	*s++ = c;
+ 
+ 	c = lex_byte(ctx, f);
+@@ -273,6 +314,25 @@ lex_name(fz_context *ctx, fz_stream *f, pdf_lexbuf *lb)
+ 	char *e = s + fz_minz(PDF_MAX_NAME_LENGTH, lb->size);
+ 	int c;
+ 
++	/* Fast path: a run of regular bytes (no '#' escapes) ending in buffered
++	 * whitespace or a delimiter, with room in the scratch. Operators and most
++	 * resource names are like this. Anything else falls to the general loop. */
++	{
++		unsigned char *p = f->rp;
++		unsigned char *end = f->wp;
++		while (p < end && !iswhite(*p) && !isdelim(*p) && *p != '#')
++			p++;
++		if (p < end && (size_t)(p - f->rp) < (size_t)(e - s))
++		{
++			size_t n = (size_t)(p - f->rp);
++			memcpy(s, f->rp, n);
++			s[n] = '\0';
++			lb->len = n;
++			f->rp = p;
++			return;
++		}
++	}
++
+ 	while (1)
+ 	{
+ 		if (s == e)

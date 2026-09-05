@@ -1,0 +1,141 @@
+fitz: atomic reference counts for pdf objects and fonts
+
+fz_keep_imp*/fz_drop_imp* wrap every ++refs / --refs in
+fz_lock(FZ_LOCK_ALLOC). On a 17k page document 11.6% of text-extraction CPU
+was that lock, with pdf_keep_obj / pdf_drop_obj / fz_keep_font / fz_drop_font
+as the main callers (xperf, native ARM64 build).
+
+The lock is only needed for storables: the store reads and writes
+item->val->refs under FZ_LOCK_ALLOC when it evicts, so their generic
+fz_keep_imp / fz_drop_imp stay as they are. pdf objects (the int16 variants,
+used only by pdf_keep_obj / pdf_drop_obj) and fonts (a new fz_keep_imp_atomic
+/ fz_drop_imp_atomic pair) switch to interlocked increment / decrement. The
+refs <= 0 "static object" test stays unlocked: a caller holding a reference
+keeps refs > 0, so it cannot change under us.
+---
+diff --git a/include/mupdf/fitz/context.h b/include/mupdf/fitz/context.h
+index 57a48c8cc..73deb40f4 100644
+--- a/include/mupdf/fitz/context.h
++++ b/include/mupdf/fitz/context.h
+@@ -1033,19 +1033,69 @@ fz_keep_imp8_aux(fz_context *ctx, void *p, int8_t *refs)
+ 	return p;
+ }
+ 
++/* Lock-free reference counts. Only for objects whose refs the store never
++ * reads or writes (pdf objects, fonts): storables must keep the locked
++ * variants above, because the store inspects item->val->refs under
++ * FZ_LOCK_ALLOC when it evicts. refs <= 0 marks a static object that is
++ * never counted; a caller holding a reference keeps refs > 0, so the sign
++ * test needs no lock either. */
++#if defined(_MSC_VER)
++#include <intrin.h>
++#define FZ_ATOMIC_INC32(p) _InterlockedIncrement((long volatile *)(p))
++#define FZ_ATOMIC_DEC32(p) _InterlockedDecrement((long volatile *)(p))
++#define FZ_ATOMIC_INC16(p) _InterlockedIncrement16((short volatile *)(p))
++#define FZ_ATOMIC_DEC16(p) _InterlockedDecrement16((short volatile *)(p))
++#else
++#define FZ_ATOMIC_INC32(p) __atomic_add_fetch((p), 1, __ATOMIC_ACQ_REL)
++#define FZ_ATOMIC_DEC32(p) __atomic_sub_fetch((p), 1, __ATOMIC_ACQ_REL)
++#define FZ_ATOMIC_INC16(p) __atomic_add_fetch((p), 1, __ATOMIC_ACQ_REL)
++#define FZ_ATOMIC_DEC16(p) __atomic_sub_fetch((p), 1, __ATOMIC_ACQ_REL)
++#endif
++
++#define fz_keep_imp_atomic(C,P,R) fz_keep_imp_atomic_aux((C), (P), (P) ? (R) : NULL)
++#define fz_drop_imp_atomic(C,P,R) fz_drop_imp_atomic_aux((C), (P), (P) ? (R) : NULL)
++
++static inline void *
++fz_keep_imp_atomic_aux(fz_context *ctx FZ_UNUSED, void *p, int *refs)
++{
++	if (p)
++	{
++		(void)Memento_checkIntPointerOrNull(refs);
++		if (*refs > 0)
++		{
++			(void)Memento_takeRef(p);
++			FZ_ATOMIC_INC32(refs);
++		}
++	}
++	return p;
++}
++
++static inline int
++fz_drop_imp_atomic_aux(fz_context *ctx FZ_UNUSED, void *p, int *refs)
++{
++	if (p)
++	{
++		(void)Memento_checkIntPointerOrNull(refs);
++		if (*refs > 0)
++		{
++			(void)Memento_dropIntRef(p);
++			return FZ_ATOMIC_DEC32(refs) == 0;
++		}
++	}
++	return 0;
++}
++
+ static inline void *
+-fz_keep_imp16_aux(fz_context *ctx, void *p, int16_t *refs)
++fz_keep_imp16_aux(fz_context *ctx FZ_UNUSED, void *p, int16_t *refs)
+ {
+ 	if (p)
+ 	{
+ 		(void)Memento_checkShortPointerOrNull(refs);
+-		fz_lock(ctx, FZ_LOCK_ALLOC);
+ 		if (*refs > 0)
+ 		{
+ 			(void)Memento_takeRef(p);
+-			++*refs;
++			FZ_ATOMIC_INC16(refs);
+ 		}
+-		fz_unlock(ctx, FZ_LOCK_ALLOC);
+ 	}
+ 	return p;
+ }
+@@ -1093,22 +1143,16 @@ fz_drop_imp8_aux(fz_context *ctx, void *p, int8_t *refs)
+ }
+ 
+ static inline int
+-fz_drop_imp16_aux(fz_context *ctx, void *p, int16_t *refs)
++fz_drop_imp16_aux(fz_context *ctx FZ_UNUSED, void *p, int16_t *refs)
+ {
+ 	if (p)
+ 	{
+-		int drop;
+ 		(void)Memento_checkShortPointerOrNull(refs);
+-		fz_lock(ctx, FZ_LOCK_ALLOC);
+ 		if (*refs > 0)
+ 		{
+ 			(void)Memento_dropShortRef(p);
+-			drop = --*refs == 0;
++			return FZ_ATOMIC_DEC16(refs) == 0;
+ 		}
+-		else
+-			drop = 0;
+-		fz_unlock(ctx, FZ_LOCK_ALLOC);
+-		return drop;
+ 	}
+ 	return 0;
+ }
+diff --git a/source/fitz/font.c b/source/fitz/font.c
+index d4fbb8ce7..cbd940e82 100644
+--- a/source/fitz/font.c
++++ b/source/fitz/font.c
+@@ -146,7 +146,8 @@ fz_new_font(fz_context *ctx, const char *name, int use_glyph_bbox, int glyph_cou
+ fz_font *
+ fz_keep_font(fz_context *ctx, fz_font *font)
+ {
+-	return fz_keep_imp(ctx, font, &font->refs);
++	/* fonts are not storables, so their refs never meet the store's lock */
++	return fz_keep_imp_atomic(ctx, font, &font->refs);
+ }
+ 
+ static void
+@@ -203,7 +204,7 @@ fz_drop_font(fz_context *ctx, fz_font *font)
+ 	int fterr;
+ 	int i;
+ 
+-	if (!fz_drop_imp(ctx, font, &font->refs))
++	if (!fz_drop_imp_atomic(ctx, font, &font->refs))
+ 		return;
+ 
+ 	free_resources(ctx, font);

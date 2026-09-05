@@ -915,6 +915,10 @@ struct fz_context
 	/* unshared contexts */
 	fz_aa_context aa;
 	uint16_t seed48[7];
+	/* recycled numeric pdf objects (pdf_new_int / pdf_new_real); singly
+	 * linked through the dead object's first bytes, freed in fz_drop_context */
+	void *num_obj_freelist;
+	int num_obj_freelist_len;
 #if FZ_ENABLE_ICC
 	int icc_enabled;
 #endif
@@ -1033,19 +1037,69 @@ fz_keep_imp8_aux(fz_context *ctx, void *p, int8_t *refs)
 	return p;
 }
 
+/* Lock-free reference counts. Only for objects whose refs the store never
+ * reads or writes (pdf objects, fonts): storables must keep the locked
+ * variants above, because the store inspects item->val->refs under
+ * FZ_LOCK_ALLOC when it evicts. refs <= 0 marks a static object that is
+ * never counted; a caller holding a reference keeps refs > 0, so the sign
+ * test needs no lock either. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define FZ_ATOMIC_INC32(p) _InterlockedIncrement((long volatile *)(p))
+#define FZ_ATOMIC_DEC32(p) _InterlockedDecrement((long volatile *)(p))
+#define FZ_ATOMIC_INC16(p) _InterlockedIncrement16((short volatile *)(p))
+#define FZ_ATOMIC_DEC16(p) _InterlockedDecrement16((short volatile *)(p))
+#else
+#define FZ_ATOMIC_INC32(p) __atomic_add_fetch((p), 1, __ATOMIC_ACQ_REL)
+#define FZ_ATOMIC_DEC32(p) __atomic_sub_fetch((p), 1, __ATOMIC_ACQ_REL)
+#define FZ_ATOMIC_INC16(p) __atomic_add_fetch((p), 1, __ATOMIC_ACQ_REL)
+#define FZ_ATOMIC_DEC16(p) __atomic_sub_fetch((p), 1, __ATOMIC_ACQ_REL)
+#endif
+
+#define fz_keep_imp_atomic(C,P,R) fz_keep_imp_atomic_aux((C), (P), (P) ? (R) : NULL)
+#define fz_drop_imp_atomic(C,P,R) fz_drop_imp_atomic_aux((C), (P), (P) ? (R) : NULL)
+
 static inline void *
-fz_keep_imp16_aux(fz_context *ctx, void *p, int16_t *refs)
+fz_keep_imp_atomic_aux(fz_context *ctx FZ_UNUSED, void *p, int *refs)
+{
+	if (p)
+	{
+		(void)Memento_checkIntPointerOrNull(refs);
+		if (*refs > 0)
+		{
+			(void)Memento_takeRef(p);
+			FZ_ATOMIC_INC32(refs);
+		}
+	}
+	return p;
+}
+
+static inline int
+fz_drop_imp_atomic_aux(fz_context *ctx FZ_UNUSED, void *p, int *refs)
+{
+	if (p)
+	{
+		(void)Memento_checkIntPointerOrNull(refs);
+		if (*refs > 0)
+		{
+			(void)Memento_dropIntRef(p);
+			return FZ_ATOMIC_DEC32(refs) == 0;
+		}
+	}
+	return 0;
+}
+
+static inline void *
+fz_keep_imp16_aux(fz_context *ctx FZ_UNUSED, void *p, int16_t *refs)
 {
 	if (p)
 	{
 		(void)Memento_checkShortPointerOrNull(refs);
-		fz_lock(ctx, FZ_LOCK_ALLOC);
 		if (*refs > 0)
 		{
 			(void)Memento_takeRef(p);
-			++*refs;
+			FZ_ATOMIC_INC16(refs);
 		}
-		fz_unlock(ctx, FZ_LOCK_ALLOC);
 	}
 	return p;
 }
@@ -1093,22 +1147,16 @@ fz_drop_imp8_aux(fz_context *ctx, void *p, int8_t *refs)
 }
 
 static inline int
-fz_drop_imp16_aux(fz_context *ctx, void *p, int16_t *refs)
+fz_drop_imp16_aux(fz_context *ctx FZ_UNUSED, void *p, int16_t *refs)
 {
 	if (p)
 	{
-		int drop;
 		(void)Memento_checkShortPointerOrNull(refs);
-		fz_lock(ctx, FZ_LOCK_ALLOC);
 		if (*refs > 0)
 		{
 			(void)Memento_dropShortRef(p);
-			drop = --*refs == 0;
+			return FZ_ATOMIC_DEC16(refs) == 0;
 		}
-		else
-			drop = 0;
-		fz_unlock(ctx, FZ_LOCK_ALLOC);
-		return drop;
 	}
 	return 0;
 }

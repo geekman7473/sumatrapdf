@@ -1,0 +1,108 @@
+pdf: flatten hmtx into a cid-indexed width table
+
+pdf_lookup_hmtx binary-searches the font's sorted width ranges for every
+glyph shown (via pdf_tos_make_trm); it was ~2% of text extraction on a large
+document. pdf_end_hmtx now also builds an int table indexed by cid (at most
+64K entries, entries outside every range hold PDF_HMTX_UNSET and fall back
+to dhmtx as before), and pdf_lookup_hmtx returns from that table. Built once
+at font load and read-only afterwards, so it is safe to share between
+threads. Overlapping /W ranges (malformed) resolve to the last in sorted
+order, where the binary search picked one arbitrarily.
+---
+diff --git a/include/mupdf/pdf/font.h b/include/mupdf/pdf/font.h
+index 59e6a010c..0a3d3018f 100644
+--- a/include/mupdf/pdf/font.h
++++ b/include/mupdf/pdf/font.h
+@@ -91,6 +91,10 @@ typedef struct
+ 	int hmtx_len, hmtx_cap;
+ 	pdf_hmtx dhmtx;
+ 	pdf_hmtx *hmtx;
++	/* hmtx flattened to a cid-indexed width table by pdf_end_hmtx; entries
++	 * not covered by any range hold PDF_HMTX_UNSET (falls back to dhmtx) */
++	int *hmtx_flat;
++	int hmtx_flat_len;
+ 
+ 	int vmtx_len, vmtx_cap;
+ 	pdf_vmtx dvmtx;
+@@ -107,6 +111,8 @@ void pdf_add_vmtx(fz_context *ctx, pdf_font_desc *font, int lo, int hi, int x, i
+ void pdf_end_hmtx(fz_context *ctx, pdf_font_desc *font);
+ void pdf_end_vmtx(fz_context *ctx, pdf_font_desc *font);
+ pdf_hmtx pdf_lookup_hmtx(fz_context *ctx, pdf_font_desc *font, int cid);
++
++#define PDF_HMTX_UNSET INT_MIN
+ pdf_vmtx pdf_lookup_vmtx(fz_context *ctx, pdf_font_desc *font, int cid);
+ 
+ void pdf_load_to_unicode(fz_context *ctx, pdf_document *doc, pdf_font_desc *font, const char **strings, char *collection, pdf_obj *cmapstm);
+diff --git a/source/pdf/pdf-font.c b/source/pdf/pdf-font.c
+index 30acc4711..c9483d385 100644
+--- a/source/pdf/pdf-font.c
++++ b/source/pdf/pdf-font.c
+@@ -648,6 +648,7 @@ pdf_drop_font_imp(fz_context *ctx, fz_storable *fontdesc_)
+ 	fz_free(ctx, fontdesc->cid_to_gid);
+ 	fz_free(ctx, fontdesc->cid_to_ucs);
+ 	fz_free(ctx, fontdesc->hmtx);
++	fz_free(ctx, fontdesc->hmtx_flat);
+ 	fz_free(ctx, fontdesc->vmtx);
+ 	fz_free(ctx, fontdesc);
+ }
+@@ -687,6 +688,8 @@ pdf_new_font_desc(fz_context *ctx)
+ 	fontdesc->hmtx_len = 0;
+ 	fontdesc->vmtx_len = 0;
+ 	fontdesc->hmtx = NULL;
++	fontdesc->hmtx_flat = NULL;
++	fontdesc->hmtx_flat_len = 0;
+ 	fontdesc->vmtx = NULL;
+ 
+ 	fontdesc->dhmtx.lo = 0x0000;
+diff --git a/source/pdf/pdf-metrics.c b/source/pdf/pdf-metrics.c
+index 0236bb7ec..111710518 100644
+--- a/source/pdf/pdf-metrics.c
++++ b/source/pdf/pdf-metrics.c
+@@ -95,10 +95,30 @@ static int cmpv(const void *a0, const void *b0)
+ void
+ pdf_end_hmtx(fz_context *ctx, pdf_font_desc *font)
+ {
++	int i, c, n;
++
+ 	if (!font->hmtx)
+ 		return;
+ 	qsort(font->hmtx, font->hmtx_len, sizeof(pdf_hmtx), cmph);
+ 	font->size += font->hmtx_cap * sizeof(pdf_hmtx);
++
++	/* Flatten the sorted ranges into a cid-indexed table: pdf_lookup_hmtx runs
++	 * once per glyph shown, and a load beats a binary search. Overlapping
++	 * ranges (malformed /W) resolve to the last one in sorted order. Built
++	 * once at font load, read-only afterwards, so safe to share between
++	 * threads. At most 64K ints. */
++	n = font->hmtx[font->hmtx_len - 1].hi + 1;
++	font->hmtx_flat = Memento_label(fz_malloc_array(ctx, n, int), "hmtx_flat");
++	for (i = 0; i < n; i++)
++		font->hmtx_flat[i] = PDF_HMTX_UNSET;
++	for (i = 0; i < font->hmtx_len; i++)
++	{
++		int hi = font->hmtx[i].hi < n - 1 ? font->hmtx[i].hi : n - 1;
++		for (c = font->hmtx[i].lo; c <= hi; c++)
++			font->hmtx_flat[c] = font->hmtx[i].w;
++	}
++	font->hmtx_flat_len = n;
++	font->size += n * sizeof(int);
+ }
+ 
+ void
+@@ -117,6 +137,16 @@ pdf_lookup_hmtx(fz_context *ctx, pdf_font_desc *font, int cid)
+ 	int r = font->hmtx_len - 1;
+ 	int m;
+ 
++	if (font->hmtx_flat)
++	{
++		pdf_hmtx h;
++		if (cid < 0 || cid >= font->hmtx_flat_len || font->hmtx_flat[cid] == PDF_HMTX_UNSET)
++			return font->dhmtx;
++		h.lo = h.hi = (unsigned short)cid;
++		h.w = font->hmtx_flat[cid];
++		return h;
++	}
++
+ 	if (!font->hmtx)
+ 		goto notfound;
+ 

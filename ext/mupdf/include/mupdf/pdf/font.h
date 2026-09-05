@@ -91,6 +91,10 @@ typedef struct
 	int hmtx_len, hmtx_cap;
 	pdf_hmtx dhmtx;
 	pdf_hmtx *hmtx;
+	/* hmtx flattened to a cid-indexed width table by pdf_end_hmtx; entries
+	 * not covered by any range hold PDF_HMTX_UNSET (falls back to dhmtx) */
+	int *hmtx_flat;
+	int hmtx_flat_len;
 
 	int vmtx_len, vmtx_cap;
 	pdf_vmtx dvmtx;
@@ -107,6 +111,8 @@ void pdf_add_vmtx(fz_context *ctx, pdf_font_desc *font, int lo, int hi, int x, i
 void pdf_end_hmtx(fz_context *ctx, pdf_font_desc *font);
 void pdf_end_vmtx(fz_context *ctx, pdf_font_desc *font);
 pdf_hmtx pdf_lookup_hmtx(fz_context *ctx, pdf_font_desc *font, int cid);
+
+#define PDF_HMTX_UNSET INT_MIN
 pdf_vmtx pdf_lookup_vmtx(fz_context *ctx, pdf_font_desc *font, int cid);
 
 void pdf_load_to_unicode(fz_context *ctx, pdf_document *doc, pdf_font_desc *font, const char **strings, char *collection, pdf_obj *cmapstm);

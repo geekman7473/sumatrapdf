@@ -1,0 +1,141 @@
+pdf: pdf_array_push_drop transfers the reference instead of keep + drop
+
+pdf_array_push_drop called pdf_array_push (which pdf_keep_obj's the item)
+and then pdf_drop_obj'd it. Each of those takes FZ_LOCK_ALLOC, and the
+content-stream interpreter goes through here for every element of every
+TJ array, so a kerned-text page paid two lock round trips per glyph offset
+on top of the allocation itself.
+
+Store the item directly: the caller's reference becomes the array's. On a
+failure to grow or alter the array the item is still dropped, as before.
+
+Also add a try-free fast path: for a direct array that is not linked into
+the file (parent_num 0, so prepare_object_for_alteration neither journals
+nor invalidates page maps), with spare capacity, taking a scalar (which
+carries no document, so the cross-document check cannot throw), nothing can
+fail, and the fz_try -- a setjmp per TJ array element -- is skipped.
+---
+diff --git a/source/pdf/pdf-object.c b/source/pdf/pdf-object.c
+index 1d5a73218..98572c4ab 100644
+--- a/source/pdf/pdf-object.c
++++ b/source/pdf/pdf-object.c
+@@ -171,11 +171,49 @@ struct pdf_journal
+ #define ARRAY(obj) ((pdf_obj_array *)(obj))
+ #define REF(obj) ((pdf_obj_ref *)(obj))
+ 
++/* The content-stream interpreter creates and drops a numeric object for every
++ * element of every TJ array. Recycle them on a per-context list (the context
++ * is per thread, so no lock) instead of a locked fz_malloc / fz_free each time.
++ * The next pointer overlays the dead object's first bytes (offset 0). */
++#define NUM_OBJ_FREELIST_MAX 1024
++
++static pdf_obj_num *
++alloc_num_obj(fz_context *ctx)
++{
++	pdf_obj_num *obj = ctx->num_obj_freelist;
++	if (obj)
++	{
++		ctx->num_obj_freelist = *(void **)obj;
++		ctx->num_obj_freelist_len--;
++		return obj;
++	}
++	return Memento_label(fz_malloc(ctx, sizeof(pdf_obj_num)), "pdf_obj(num)");
++}
++
++static void
++free_num_obj(fz_context *ctx, pdf_obj *obj)
++{
++	if (ctx->num_obj_freelist_len >= NUM_OBJ_FREELIST_MAX)
++	{
++		fz_free(ctx, obj);
++		return;
++	}
++	*(void **)obj = ctx->num_obj_freelist;
++	ctx->num_obj_freelist = obj;
++	ctx->num_obj_freelist_len++;
++}
++
++static int
++is_num_obj(pdf_obj *obj)
++{
++	return obj->kind == PDF_INT || obj->kind == PDF_REAL;
++}
++
+ pdf_obj *
+ pdf_new_int(fz_context *ctx, int64_t i)
+ {
+ 	pdf_obj_num *obj;
+-	obj = Memento_label(fz_malloc(ctx, sizeof(pdf_obj_num)), "pdf_obj(int)");
++	obj = alloc_num_obj(ctx);
+ 	obj->super.refs = 1;
+ 	obj->super.kind = PDF_INT;
+ 	obj->super.flags = 0;
+@@ -187,7 +225,7 @@ pdf_obj *
+ pdf_new_real(fz_context *ctx, float f)
+ {
+ 	pdf_obj_num *obj;
+-	obj = Memento_label(fz_malloc(ctx, sizeof(pdf_obj_num)), "pdf_obj(real)");
++	obj = alloc_num_obj(ctx);
+ 	obj->super.refs = 1;
+ 	obj->super.kind = PDF_REAL;
+ 	obj->super.flags = 0;
+@@ -2004,12 +2042,38 @@ pdf_array_push(fz_context *ctx, pdf_obj *obj, pdf_obj *item)
+ void
+ pdf_array_push_drop(fz_context *ctx, pdf_obj *obj, pdf_obj *item)
+ {
++	/* The caller's reference to item moves into the array, so store it
++	 * directly rather than keep + drop: each of those is a lock round trip,
++	 * paid for every element of every TJ array. */
++
++	/* Fast path, no fz_try (a setjmp per element otherwise): a direct array
++	 * that is not linked into the file (parent_num 0, so no journaling and no
++	 * page-map invalidation), with room, taking a scalar -- a number, string,
++	 * name, bool or null carries no document, so nothing here can throw. */
++	if (obj >= PDF_LIMIT && obj->kind == PDF_ARRAY && ARRAY(obj)->parent_num == 0 &&
++		ARRAY(obj)->len < ARRAY(obj)->cap &&
++		(item < PDF_LIMIT || (item->kind != PDF_ARRAY && item->kind != PDF_DICT && item->kind != PDF_INDIRECT)))
++	{
++		ARRAY(obj)->items[ARRAY(obj)->len++] = item;
++		return;
++	}
++
+ 	fz_try(ctx)
+-		pdf_array_push(ctx, obj, item);
+-	fz_always(ctx)
+-		pdf_drop_obj(ctx, item);
++	{
++		RESOLVE(obj);
++		if (!OBJ_IS_ARRAY(obj))
++			fz_throw(ctx, FZ_ERROR_ARGUMENT, "not an array (%s)", pdf_objkindstr(obj));
++		prepare_object_for_alteration(ctx, obj, item);
++		if (ARRAY(obj)->len + 1 > ARRAY(obj)->cap)
++			pdf_array_grow(ctx, ARRAY(obj));
++		ARRAY(obj)->items[ARRAY(obj)->len] = item;
++		ARRAY(obj)->len++;
++	}
+ 	fz_catch(ctx)
++	{
++		pdf_drop_obj(ctx, item);
+ 		fz_rethrow(ctx);
++	}
+ }
+ 
+ void
+@@ -3143,6 +3207,8 @@ pdf_drop_obj(fz_context *ctx, pdf_obj *obj)
+ 				fz_free(ctx, STRING(obj)->text);
+ 				fz_free(ctx, obj);
+ 			}
++			else if (is_num_obj(obj))
++				free_num_obj(ctx, obj);
+ 			else
+ 				fz_free(ctx, obj);
+ 		}
+@@ -3179,6 +3245,8 @@ pdf_drop_singleton_obj(fz_context *ctx, pdf_obj *obj)
+ 		fz_free(ctx, STRING(obj)->text);
+ 		fz_free(ctx, obj);
+ 	}
++	else if (is_num_obj(obj))
++		free_num_obj(ctx, obj);
+ 	else
+ 		fz_free(ctx, obj);
+ 

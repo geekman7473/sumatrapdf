@@ -26,6 +26,55 @@
 
 #define MIN_BOMB (100 << 20)
 
+/* Refill paths of the inline fz_read_byte / fz_peek_byte (see stream.h). */
+int
+fz_read_byte_slow(fz_context *ctx, fz_stream *stm)
+{
+	int c = EOF;
+
+	if (stm->eof)
+		return EOF;
+	fz_try(ctx)
+		c = stm->next(ctx, stm, 1);
+	fz_catch(ctx)
+	{
+		fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
+		fz_report_error(ctx);
+		fz_warn(ctx, "read error; treating as end of file");
+		stm->error = 1;
+		c = EOF;
+	}
+	if (c == EOF)
+		stm->eof = 1;
+	return c;
+}
+
+int
+fz_peek_byte_slow(fz_context *ctx, fz_stream *stm)
+{
+	int c = EOF;
+
+	if (stm->eof)
+		return EOF;
+	fz_try(ctx)
+	{
+		c = stm->next(ctx, stm, 1);
+		if (c != EOF)
+			stm->rp--;
+	}
+	fz_catch(ctx)
+	{
+		fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
+		fz_report_error(ctx);
+		fz_warn(ctx, "read error; treating as end of file");
+		stm->error = 1;
+		c = EOF;
+	}
+	if (c == EOF)
+		stm->eof = 1;
+	return c;
+}
+
 size_t
 fz_read(fz_context *ctx, fz_stream *stm, unsigned char *buf, size_t len)
 {

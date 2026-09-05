@@ -103,8 +103,10 @@ fz_grow_text_span(fz_context *ctx, fz_text_span *span, int n)
 	int new_cap = span->cap;
 	if (span->len + n < new_cap)
 		return;
+	/* Grow geometrically: a fixed +36 meant a realloc (and copy) every 36
+	 * glyphs, so a long span cost O(n^2 / 36) in memcpy. */
 	while (span->len + n > new_cap)
-		new_cap = new_cap + 36;
+		new_cap = new_cap < 36 ? 36 : new_cap * 2;
 	span->items = fz_realloc_array(ctx, span->items, new_cap, fz_text_item);
 	span->cap = new_cap;
 }

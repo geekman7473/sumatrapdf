@@ -439,27 +439,17 @@ static inline size_t fz_available(fz_context *ctx, fz_stream *stm, size_t max)
 	Returns -1 for end of stream, or the next byte. May
 	throw exceptions.
 */
+int fz_read_byte_slow(fz_context *ctx, fz_stream *stm);
+int fz_peek_byte_slow(fz_context *ctx, fz_stream *stm);
+
 static inline int fz_read_byte(fz_context *ctx, fz_stream *stm)
 {
-	int c = EOF;
-
+	/* The refill path holds a fz_try (setjmp), and MSVC never inlines a
+	 * function containing setjmp, so it lives out of line to keep this
+	 * common case inlinable. */
 	if (stm->rp != stm->wp)
 		return *stm->rp++;
-	if (stm->eof)
-		return EOF;
-	fz_try(ctx)
-		c = stm->next(ctx, stm, 1);
-	fz_catch(ctx)
-	{
-		fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
-		fz_report_error(ctx);
-		fz_warn(ctx, "read error; treating as end of file");
-		stm->error = 1;
-		c = EOF;
-	}
-	if (c == EOF)
-		stm->eof = 1;
-	return c;
+	return fz_read_byte_slow(ctx, stm);
 }
 
 /**
@@ -471,30 +461,9 @@ static inline int fz_read_byte(fz_context *ctx, fz_stream *stm)
 */
 static inline int fz_peek_byte(fz_context *ctx, fz_stream *stm)
 {
-	int c = EOF;
-
 	if (stm->rp != stm->wp)
 		return *stm->rp;
-	if (stm->eof)
-		return EOF;
-
-	fz_try(ctx)
-	{
-		c = stm->next(ctx, stm, 1);
-		if (c != EOF)
-			stm->rp--;
-	}
-	fz_catch(ctx)
-	{
-		fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
-		fz_report_error(ctx);
-		fz_warn(ctx, "read error; treating as end of file");
-		stm->error = 1;
-		c = EOF;
-	}
-	if (c == EOF)
-		stm->eof = 1;
-	return c;
+	return fz_peek_byte_slow(ctx, stm);
 }
 
 /**

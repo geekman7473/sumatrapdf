@@ -648,6 +648,7 @@ pdf_drop_font_imp(fz_context *ctx, fz_storable *fontdesc_)
 	fz_free(ctx, fontdesc->cid_to_gid);
 	fz_free(ctx, fontdesc->cid_to_ucs);
 	fz_free(ctx, fontdesc->hmtx);
+	fz_free(ctx, fontdesc->hmtx_flat);
 	fz_free(ctx, fontdesc->vmtx);
 	fz_free(ctx, fontdesc);
 }
@@ -687,6 +688,8 @@ pdf_new_font_desc(fz_context *ctx)
 	fontdesc->hmtx_len = 0;
 	fontdesc->vmtx_len = 0;
 	fontdesc->hmtx = NULL;
+	fontdesc->hmtx_flat = NULL;
+	fontdesc->hmtx_flat_len = 0;
 	fontdesc->vmtx = NULL;
 
 	fontdesc->dhmtx.lo = 0x0000;

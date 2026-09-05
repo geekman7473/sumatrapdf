@@ -10,7 +10,11 @@ does and why.
 
 **Base revision: mupdf `1.28.2`** (tag `1.28.2`, commit `fe374accd`), the
 version recorded for mupdf in `ext/versions.txt`. Paths in the patches are
-relative to `ext/mupdf`, so `-p1` from inside that directory.
+relative to `ext/mupdf`, so `-p1` from inside that directory with GNU `patch`,
+or from the repo root with `git apply --directory=ext/mupdf -p1 <patch>`.
+Don't run `git apply -p1` from inside `ext/mupdf`: inside a repository it
+resolves paths against the repo root and silently ignores the ones outside
+the current directory, so it reports success and changes nothing.
 
 ## The patches
 
@@ -47,6 +51,42 @@ relative to `ext/mupdf`, so `-p1` from inside that directory.
 | `0036-ocg-usage-event-on-visible` | PrintState/ViewState ON draws the OCG even if it is in the config `/OFF` list (#6101) |
 | `0037-backport-709648-inline-context-after-block` | stop adding to an inline context after a block interrupts it (covers #5943) |
 | `0038-html-css-background-image` | CSS `background-image` / `-size` / `-position` / `-repeat` on block boxes; fixed-layout scan EPUBs were blank (#6131) |
+| `0039-tounicode-skip-remap-for-identity-encoding` | Identity-H/V fonts keep the ToUnicode cmap as-is instead of remapping all 65536 codes per font load (~40 ms each) |
+| `0040-stream-inlinable-read-byte` | `fz_read_byte` / `fz_peek_byte` refill (with its `fz_try`) moved out of line so the fast path inlines; MSVC never inlines a function containing setjmp |
+| `0041-pdf-array-push-drop-transfers-ref` | `pdf_array_push_drop` stores the item instead of keep + drop (two lock round trips per `TJ` array element) |
+| `0042-fitz-atomic-refcounts-pdf-obj-font` | interlocked refcounts for pdf objects and fonts; storables keep the `FZ_LOCK_ALLOC` variants the store relies on |
+| `0043-pdf-recycle-numeric-objects` | per-context freelist for `pdf_new_int` / `pdf_new_real` objects, created and dropped per `TJ` array element |
+| `0044-pdf-lex-buffered-fast-paths` | `lex_white` skips buffered whitespace in place; `lex_number` accumulates a plain digit run while scanning instead of copy-then-`fast_atoi`; `lex_name` copies a plain (no `#`) name straight from the buffer |
+| `0045-pdf-hmtx-flat-width-table` | `pdf_end_hmtx` flattens the width ranges into a cid-indexed table so the per-glyph `pdf_lookup_hmtx` is a load, not a binary search |
+| `0046-fitz-text-span-geometric-growth` | `fz_grow_text_span` doubles instead of adding 36 items, so a long text span is not reallocated and copied every 36 glyphs |
+
+## Performance patches 0039-0046: measured effect
+
+Patches 0039-0046 came out of profiling the first text search on a large PDF
+(ARM Architecture Reference Manual DDI0487M, 17,145 pages, 30.5 M characters),
+which extracts text from every page. Numbers below are from an ablation on
+2026-09-05: with all eight applied, each patch was reverse-applied alone, the
+tree rebuilt, and the cold first search timed twice. "Gain" is how much slower
+the build gets without that patch, i.e. its marginal value with the others
+present. Native ARM64 Release build, mupdf at /O2, baseline 11.6 s, run-to-run
+noise about +-0.15 s. Search results were identical to the unpatched build in
+every configuration (whole-document match-page lists for four terms).
+
+| Patch | Gain | Share | Notes |
+| --- | --- | --- | --- |
+| `0039-tounicode-skip-remap-for-identity-encoding` | 2.1 s | 18% | one-time per CID font load; also speeds up open / first render of any Identity-H document |
+| `0041-pdf-array-push-drop-transfers-ref` | 0.9 s | 8% | two lock round trips and a setjmp per `TJ` array element |
+| `0042-fitz-atomic-refcounts-pdf-obj-font` | 0.7 s | 6% | storables deliberately keep the locked path (the store reads `refs` under `FZ_LOCK_ALLOC`) |
+| `0043-pdf-recycle-numeric-objects` | 0.5 s | 5% | overlaps with 0042: fewer allocations means fewer locks too |
+| `0040-stream-inlinable-read-byte` | 0.2 s | 2% | larger on /O1 builds, where nothing else inlines either |
+| `0044-pdf-lex-buffered-fast-paths` | 0.2 s | 1.5% | |
+| `0045-pdf-hmtx-flat-width-table` | 0.15 s | 1.3% | at the noise limit; +4 bytes per cid per large CID font |
+| `0046-fitz-text-span-geometric-growth` | ~0 | -- | no measurable effect on this document (short spans); algorithmic fix only |
+
+The marginals sum to ~4.7 s against the 11.6 s baseline; the total without all
+eight is larger than the sum because they overlap. None of these are
+Sumatra-specific; all are candidates for upstreaming, 0042 with the storable
+argument made explicitly.
 
 And ten that are not ours but that we carry ahead of the release we vendor:
 
